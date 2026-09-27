@@ -1,0 +1,299 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\topk}{\text{top-}k}
+\newcommand{\question}[1]{\noindent\textit{Question: #1}\par\medskip}
+
+\title{Retrieval-Augmented Generation: Questions and Answers\\[4pt]
+  \large Notes on Lewis et al.\ (2020)}
+\date{}
+
+\begin{document}
+\maketitle
+
+% Questions are ordered as a learning path (basic ideas -> building blocks -> whole picture -> equations),
+% not by the order in which they were asked. The section number is the question index.
+
+\section{Parametric and Non-Parametric Memory}\label{sec:memory}
+\question{What is ``parametric and non-parametric memory'' in this context?}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l Y Y@{}}
+\toprule
+ & \textbf{Parametric memory} & \textbf{Non-parametric memory} \\
+\midrule
+What it is in RAG & The weights $\theta$ of the BART generator (400M parameters) & The document index: 21M Wikipedia passages plus their vectors \\
+\addlinespace
+Where knowledge lives & Implicitly, spread across the weights, learned during pre-training & Explicitly, as readable text outside the model \\
+\addlinespace
+How to update it & Retrain or fine-tune & Replace the index; no training needed (``index hot-swapping'', \S4.5) \\
+\addlinespace
+Can you inspect it? & No & Yes: you can see which passage was used, which gives provenance \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+A good analogy: parametric memory is what a student has \textbf{memorized} (closed-book exam). Non-parametric memory is the \textbf{textbook they bring} (open-book exam).
+
+``Non-parametric'' is used in the same sense as $k$-nearest-neighbours. The model does not compress the data into a fixed set of parameters. It keeps the data and looks things up, so the memory can grow or change without changing the model's size.
+
+\section{RAG vs.\ LoRA}
+\question{Do RAG and LoRA have the same goal, namely letting the model access knowledge outside the data it was trained on?}
+
+\textbf{Not quite.} They overlap a little, but they solve different problems:
+\begin{itemize}[nosep]
+  \item \textbf{RAG} keeps knowledge \textbf{outside} the model and fetches it at inference time. The model gets access to information it never saw in training.
+  \item \textbf{LoRA} is a \textbf{cheap way to fine-tune}. It freezes the original weights $W$ and learns a small low-rank update $\Delta W = BA$. Whatever it is trained on ends up \textbf{inside the parameters}, so LoRA is still parametric memory. The new data simply becomes more training data.
+\end{itemize}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l Y Y@{}}
+\toprule
+ & \textbf{RAG} & \textbf{LoRA} \\
+\midrule
+Where knowledge goes & External index & Into the (adapter) weights \\
+\addlinespace
+Adding new facts & Add documents to the index & Collect data and train again \\
+\addlinespace
+Can cite sources & Yes & No \\
+\addlinespace
+Typically good at & Facts, fast-changing or private knowledge & Adapting behavior, style, format, a task or domain \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+In short, LoRA is like studying for the exam, and RAG is like bringing the book. Later studies (e.g.\ Ovadia et al.\ 2023, ``Fine-Tuning or Retrieval?'') found that fine-tuning is fairly unreliable for injecting new facts, while retrieval works better for that.
+
+The two are \textbf{complementary}. In this paper the generator and query encoder are fine-tuned (fully, since LoRA came out a year later) so the model learns \textbf{how to use} retrieved documents, not to memorize the facts. Today LoRA is often used for exactly that fine-tuning step of a RAG system.
+
+\section{What a ``Document'' Is}\label{sec:document}
+\question{What is the ``document'' in this context?}
+
+A \textbf{document $z$ is a 100-word passage of Wikipedia, not a whole article.} From \S3: the authors take the December 2018 Wikipedia dump and split each article into \textbf{disjoint 100-word chunks}, which gives about \textbf{21 million documents}. Each chunk is encoded by $\mathrm{BERT}_d$ into a vector and stored in the FAISS index.
+
+The paper uses ``document'' and ``passage'' interchangeably. In today's RAG terminology this is a \textbf{chunk}. Small chunks are used for two reasons:
+\begin{itemize}[nosep]
+  \item The encoder produces a more precise vector for a short, focused passage.
+  \item The passage has to fit in BART's input together with $x$, because they are simply concatenated (\S2.3).
+\end{itemize}
+
+Real examples appear in Figure~2 (page 7): ``Document 1: \dots His wartime experiences formed the basis for his novel `A Farewell to Arms' \dots'' is one such 100-word chunk.
+
+\section{Retriever and Retrieve}
+\question{What is ``retriever'' and ``retrieve'' in this context?}
+
+\textbf{Retrieve} means: given an input $x$ (a question, a claim, \dots), look up the most relevant pieces of text in a large external collection (here, Wikipedia). It works like a search engine.
+
+The \textbf{retriever} is the component that does this search. The paper writes it as $p_\eta(z \mid x)$: a probability distribution over documents $z$ given the input $x$. It is built on DPR (Dense Passage Retriever, Section~\ref{sec:dpr}), which uses two BERT encoders (Section~\ref{sec:bert}; paper \S2.2):
+\begin{itemize}[nosep]
+  \item \textbf{Query encoder} $\mathbf{q}(x) = \mathrm{BERT}_q(x)$ turns the input into a vector.
+  \item \textbf{Document encoder} $\mathbf{d}(z) = \mathrm{BERT}_d(z)$ turns each Wikipedia passage into a vector. This is done once, ahead of time, and stored in an index.
+\end{itemize}
+Retrieval then means finding the $K$ documents whose vectors have the highest dot product with the query vector:
+\begin{equation}
+  \topk\big(p_\eta(\cdot \mid x)\big) = \text{the $K$ documents $z$ with the largest } \mathbf{d}(z)^{\top}\mathbf{q}(x).
+\end{equation}
+This search is called \textbf{MIPS} (Maximum Inner Product Search). The paper uses FAISS so it stays fast over 21M documents.
+
+\section{BERT}\label{sec:bert}
+\question{What is BERT in this context?}
+
+\textbf{BERT} stands for \emph{Bidirectional Encoder Representations from Transformers} (Devlin et al., 2018). It is a neural network that \textbf{reads a text and turns it into a vector}, a list of numbers that captures what the text means. It only \emph{understands} text. It does \textbf{not} write text.
+
+Three things to know:
+\begin{itemize}[nosep]
+  \item \textbf{Encoder.} Text goes in, vectors come out. (BART in Section~\ref{sec:bart} also has a decoder, which writes text. BERT has none.)
+  \item \textbf{Bidirectional.} It reads the whole text at once and looks at the words on the left \emph{and} on the right of every word. So ``bank'' gets a different vector in ``river bank'' than in ``bank account''.
+  \item \textbf{Pre-trained by fill-in-the-blank.} About 15\% of the words are hidden, and BERT learns to guess them from the other words. This needs a lot of text but no labels.
+\end{itemize}
+The paper uses the small version, $\text{BERT}_{\text{BASE}}$: 12 layers, a vector of 768 numbers per text, and 110M parameters (Appendix~G).
+
+\paragraph{Where BERT appears in RAG.}
+BERT is not the whole retriever. It is a \textbf{building block inside DPR} (Section~\ref{sec:dpr}). RAG uses two separate copies of it (\S2.2):
+\begin{itemize}[nosep]
+  \item $\mathbf{q}(x) = \mathrm{BERT}_q(x)$ turns the input (for example a question) into a vector. It is \textbf{fine-tuned} during RAG training.
+  \item $\mathbf{d}(z) = \mathrm{BERT}_d(z)$ turns each Wikipedia passage into a vector. It stays \textbf{frozen} (\S2.4).
+\end{itemize}
+Each text becomes one vector (DPR takes the output at the special \texttt{[CLS]} token at the start of the text, which acts as a summary of the whole text). Texts with a similar meaning get similar vectors, so a large dot product means ``these two texts are about the same thing''. For example, the question ``Who wrote A Farewell to Arms?'' and the passage about Hemingway (Figure~2 of the paper) get similar vectors, even if they share few words.
+
+\paragraph{What BERT does not do.}
+It does not write the answer. In RAG, writing is the job of BART.
+
+A simple picture: BERT is a \textbf{reader who writes a short ``meaning fingerprint''} for any text. Two texts with similar fingerprints are about similar things.
+
+\section{DPR}\label{sec:dpr}
+\question{What is DPR in this context?}
+
+\textbf{DPR} stands for \textbf{Dense Passage Retriever} (Karpukhin et al., 2020). It is a method for \textbf{finding the passages that help answer a question}. In RAG, DPR \emph{is} the retriever $p_\eta(z \mid x)$ (\S1 and \S2.2).
+
+The name explains the idea:
+\begin{itemize}[nosep]
+  \item \textbf{Passage}: a 100-word chunk of Wikipedia (Section~\ref{sec:document}).
+  \item \textbf{Dense}: every text becomes a dense vector (768 numbers) made by a neural network. The older way (TF-IDF, BM25) is \emph{sparse}: it only counts matching words. A dense vector matches \textbf{meaning}, so ``Who wrote\dots?'' can match a passage that says ``authored by\dots''.
+  \item \textbf{Retriever}: it looks things up, it does not write.
+\end{itemize}
+
+\paragraph{How it works.} DPR is a \textbf{bi-encoder}, which means two BERT encoders (Section~\ref{sec:bert}):
+\begin{enumerate}[nosep]
+  \item \textbf{Offline, once:} $\mathrm{BERT}_d$ turns all 21M passages into vectors, which are stored in a FAISS index.
+  \item \textbf{Online, for each input:} $\mathrm{BERT}_q$ turns the input $x$ into a vector $\mathbf{q}(x)$.
+  \item \textbf{Search (MIPS):} return the $K$ passages with the largest dot product $\mathbf{d}(z)^{\top}\mathbf{q}(x)$.
+\end{enumerate}
+The score becomes a probability with $p_\eta(z \mid x) \propto \exp\!\big(\mathbf{d}(z)^{\top}\mathbf{q}(x)\big)$.
+
+\paragraph{Why two separate encoders?}
+A passage does not depend on the question, so all passages can be encoded \textbf{ahead of time}. At question time only the question is encoded, and this is why searching 21M passages is fast. The price is that the question and the passage never ``see'' each other inside the network, so the match is less exact than with a \emph{cross-encoder}, which reads both together but is far too slow to run on 21M passages. The original DPR question-answering system adds such a cross-encoder to re-rank the results. The RAG paper shows that this extra step is not needed (\S4.1).
+
+\paragraph{How DPR was trained.}
+Training data are questions, each with a passage that contains the answer (a \emph{positive}) and passages that do not (\emph{negatives}). The two encoders learn to give the question a higher dot product with the positive than with the negatives. RAG starts from a DPR trained this way on Natural Questions and TriviaQA (\S2.2). During RAG training only the query encoder is updated. The document encoder and the index stay frozen (\S2.4). The index built with the document encoder is the \textbf{non-parametric memory} (Section~\ref{sec:memory}).
+
+A simple picture: DPR is a \textbf{librarian who understands meaning}. Every passage sits at a spot on a big map, and passages with similar meaning sit close together. The question is placed on the same map, and the librarian grabs the $K$ closest passages. The librarian only \textbf{fetches}. Someone else has to read them and write the answer.
+
+\section{BART}\label{sec:bart}
+\question{What is BART in this context?}
+
+\textbf{BART} stands for \emph{Bidirectional and Auto-Regressive Transformers} (Lewis et al., 2019). It is a \textbf{sequence-to-sequence (seq2seq)} model: it reads one text and \textbf{writes another text}. In RAG it is the \textbf{generator} $p_\theta(y_i \mid x, z, y_{1:i-1})$ (\S2.3). The paper uses BART-large, with about 400M parameters (406M in Appendix~G). Its weights $\theta$ are the \textbf{parametric memory} (Section~\ref{sec:memory}).
+
+BART has two parts:
+\begin{itemize}[nosep]
+  \item \textbf{Encoder} (like BERT). It reads the whole input, looking left and right of every word (``Bidirectional'').
+  \item \textbf{Decoder} (like GPT). It writes the output \textbf{one token at a time, from left to right}. Each new token depends on the tokens already written (``Auto-Regressive'') and on what the encoder read.
+\end{itemize}
+So BART is roughly a \textbf{BERT-style reader plus a GPT-style writer}.
+
+\paragraph{How it was pre-trained.}
+BART learns by \textbf{denoising}. Clean text is damaged (words are hidden or deleted, sentences are shuffled), and BART must rebuild the original. This is like fixing a scrambled sentence. It makes BART good at writing fluent text, and it reached state-of-the-art results on many generation tasks (\S2.3).
+
+\paragraph{BART inside RAG.}
+\begin{itemize}[nosep]
+  \item \textbf{Input:} the original input $x$ and a retrieved passage $z$ are simply \textbf{concatenated} and given to the encoder (\S2.3).
+  \item \textbf{Output:} the decoder writes the answer $y$ token by token.
+  \item BART runs once for each of the $K$ retrieved passages, and the results are combined by marginalization (see Section~\ref{sec:equations}).
+  \item \textbf{All of BART is fine-tuned} during RAG training.
+\end{itemize}
+Example: the input is ``Who wrote A Farewell to Arms?'' plus the Hemingway passage, and BART writes ``Ernest Hemingway''. It can also write a sentence or a paragraph in its own words. It is not limited to copying text from the passage.
+
+A simple picture: BART is the \textbf{student who reads the question and the fetched pages, then writes the answer}.
+
+\section{DPR vs.\ BART}\label{sec:dprbart}
+\question{What is the difference between DPR and BART?}
+
+\textbf{Short answer:} DPR \textbf{finds} text and BART \textbf{writes} text. They are two different parts of RAG, and they work one after the other:
+\begin{equation*}
+  x \;\xrightarrow{\ \text{DPR: search}\ }\; z_1, \dots, z_K \;\xrightarrow{\ \text{BART: read } x + z_i,\ \text{write}\ }\; y .
+\end{equation*}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l Y Y@{}}
+\toprule
+ & \textbf{DPR} & \textbf{BART} \\
+\midrule
+Job in RAG & Retriever: finds the top-$K$ passages & Generator: writes the answer \\
+\addlinespace
+Symbol in the paper & $p_\eta(z \mid x)$ & $p_\theta(y_i \mid x, z, y_{1:i-1})$ \\
+\addlinespace
+Built from & Two $\text{BERT}_{\text{BASE}}$ encoders (a bi-encoder), no decoder & One encoder--decoder Transformer (BART-large) \\
+\addlinespace
+Size in the paper & 110M per encoder & about 406M \\
+\addlinespace
+Input & The question $x$ or a passage $z$, encoded \emph{separately} & $x$ and $z$ \emph{together} (concatenated) \\
+\addlinespace
+Output & One vector per text; the score is a dot product & Text, one token at a time \\
+\addlinespace
+Can it write new text? & No. It can only return existing passages & Yes \\
+\addlinespace
+Pre-training & BERT: guess hidden words. Then DPR: question--passage pairs & Denoising: rebuild damaged text \\
+\addlinespace
+Memory in RAG & Gives access to the index (non-parametric memory) & Its weights $\theta$ are the parametric memory \\
+\addlinespace
+Trained in RAG? & Only $\mathrm{BERT}_q$. $\mathrm{BERT}_d$ and the index stay frozen & All of BART \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{What they have in common.}
+Both are Transformers, both were pre-trained on a lot of text before RAG, and both contain a BERT-style encoder that reads in both directions. The difference is what is built on top. DPR is \textbf{two encoders}: it can turn text into vectors and compare them, but it has \textbf{no decoder}, so it cannot write. BART is \textbf{an encoder plus a decoder}: it can write, but it has \textbf{no search}. It only knows what is stored in its weights and what is put into its input.
+
+\paragraph{Why RAG needs both.}
+BART alone is a closed-book exam: it can only use what it memorized. DPR is what lets it take an open-book exam. This also shows how each part can fail:
+\begin{itemize}[nosep]
+  \item If DPR fetches the \textbf{wrong passages}, BART may write a fluent but wrong answer.
+  \item If BART is weak, the passages may be \textbf{right} but the answer is poorly written or misses the point.
+\end{itemize}
+
+\section{\texorpdfstring{Figure 1, and the Meaning of $p$ and $q$}{Figure 1, and the Meaning of p and q}}
+\question{Explain Figure 1. What are $p$ and $q$, and what is the difference between them?}
+
+Reading the figure from left to right:
+\begin{enumerate}[nosep]
+  \item \textbf{Input $x$} is one of three task examples: a question (``Define middle ear''), a claim to verify (``Barack Obama was born in Hawaii.''), or a Jeopardy answer (``The Divine Comedy'').
+  \item \textbf{Query encoder $\mathbf{q}(x)$} turns $x$ into a vector.
+  \item \textbf{MIPS over the document index} compares that vector with every precomputed $\mathbf{d}(z)$ and returns the top-$K$ documents $z_1, \dots, z_4$. Steps 2--3 together form the retriever $p_\eta$, labelled ``Non-Parametric''.
+  \item \textbf{Generator $p_\theta$} (BART, labelled ``Parametric'') takes $x$ concatenated with each $z_i$ and generates the output $y$.
+  \item \textbf{Marginalize} combines the predictions from all $K$ documents into one final answer, weighted by how relevant each document is.
+  \item \textbf{``End-to-End Backprop through $q$ and $p_\theta$''}: during training, gradients update the query encoder and BART. The document encoder $\mathbf{d}(z)$ and the index stay \textbf{frozen} (\S2.4), because re-encoding 21M documents after every update would be too expensive.
+\end{enumerate}
+
+\paragraph{The difference between $p$ and $q$.}
+\begin{itemize}[nosep]
+  \item \textbf{$p$ is always a probability distribution.} The subscript tells you which parameters it uses:
+  \begin{itemize}[nosep]
+    \item $p_\eta(z \mid x)$: the retriever. It gives the probability that document $z$ is relevant to $x$; $\eta$ are the retriever's parameters.
+    \item $p_\theta(y_i \mid x, z, y_{1:i-1})$: the generator. It gives the probability of the next token; $\theta$ are BART's parameters.
+  \end{itemize}
+  \item \textbf{$\mathbf{q}$ is not a probability.} It is the \textbf{query encoder function}, which outputs a vector. It is one ingredient of $p_\eta$:
+\end{itemize}
+\begin{equation}
+  p_\eta(z \mid x) \;\propto\; \exp\!\big(\mathbf{d}(z)^{\top}\mathbf{q}(x)\big).
+\end{equation}
+So $\mathbf{q}$ (and $\mathbf{d}$) produce the vectors, and $p_\eta$ turns their dot-product scores into probabilities (a softmax over the retrieved documents).
+
+If you have seen $q$ in VAEs, where it means an approximate posterior: that is \emph{not} its meaning here.
+
+\section{The RAG-Sequence and RAG-Token Equations}\label{sec:equations}
+\question{Explain the equations for RAG-Sequence and RAG-Token.}
+
+In both models the retrieved document $z$ is treated as a \textbf{latent variable}. We do not know which document is ``correct'', so we sum over the top-$K$ candidates, weighting each by the retriever's probability. This is the law of total probability:
+\begin{equation}
+  p(y \mid x) = \sum_z p(z \mid x)\, p(y \mid x, z).
+\end{equation}
+
+\paragraph{RAG-Sequence.}
+\begin{equation}
+\begin{split}
+  p_{\text{RAG-Sequence}}(y \mid x) &\;\approx\; \sum_{z \in \topk} p_\eta(z \mid x)\, p_\theta(y \mid x, z) \\
+  &\;=\; \sum_{z \in \topk} p_\eta(z \mid x) \prod_{i=1}^{N} p_\theta(y_i \mid x, z, y_{1:i-1}).
+\end{split}
+\end{equation}
+Here the \textbf{sum is outside the product}. For each document, generate the whole answer using only that document (the product over tokens $i$). Then take a weighted average of those full-sequence probabilities. The assumption is that one document is responsible for the entire output.
+
+\paragraph{RAG-Token.}
+\begin{equation}
+  p_{\text{RAG-Token}}(y \mid x) \;\approx\; \prod_{i=1}^{N} \sum_{z \in \topk} p_\eta(z \mid x)\, p_\theta(y_i \mid x, z, y_{1:i-1}).
+\end{equation}
+Here the \textbf{sum is inside the product}. At each token, mix the next-token distributions from all $K$ documents, pick the token, then move on. Different tokens can be supported by different documents.
+
+\paragraph{A small numeric example.}
+Take two documents with $p_\eta(z_1 \mid x) = 0.7$ and $p_\eta(z_2 \mid x) = 0.3$, and a 2-token answer $y = (y_1, y_2)$. Token $y_1$ is well supported by $z_1$ (0.9 vs.\ 0.2). Token $y_2$ is well supported by $z_2$ (0.9 vs.\ 0.1).
+\begin{align}
+  \text{RAG-Sequence:}\quad & 0.7 \cdot (0.9 \cdot 0.1) + 0.3 \cdot (0.2 \cdot 0.9) = 0.063 + 0.054 = 0.117, \\
+  \text{RAG-Token:}\quad & (0.7 \cdot 0.9 + 0.3 \cdot 0.2) \cdot (0.7 \cdot 0.1 + 0.3 \cdot 0.9) = 0.69 \cdot 0.34 \approx 0.235.
+\end{align}
+RAG-Token gives this answer about twice the probability, because it can \textbf{combine information from several documents}. That is exactly the paper's Figure~2 (the Hemingway example): ``The Sun Also Rises'' comes from Document~2 and ``A Farewell to Arms'' comes from Document~1. It is also why RAG-Token does best on Jeopardy question generation (\S4.3).
+
+\paragraph{Details worth knowing.}
+\begin{itemize}[nosep]
+  \item In \textbf{both} models, retrieval happens \textbf{once per input}. RAG-Token does not search again for each token. It reuses the same $K$ documents and re-weights them per token.
+  \item For classification (e.g.\ FEVER), the output is a single token ($N = 1$), so the two formulas become identical.
+  \item Training minimizes $-\sum_j \log p(y_j \mid x_j)$. Because $p_\eta(z \mid x)$ sits inside that formula, the retriever learns which documents help, even with \textbf{no labels saying which document is correct}.
+  \item For decoding (\S2.5), RAG-Token works with a normal beam search. RAG-Sequence needs a separate beam search per document (``Thorough'' or ``Fast'' decoding).
+\end{itemize}
+
+\end{document}

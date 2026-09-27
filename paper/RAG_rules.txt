@@ -1,0 +1,9 @@
+If you receive a command to save my questions into RAG_QA.tex and RAG_QA.pdf, do the following:
+
+1. All questions must always be written in English.
+
+2. Sort the questions in ascending order by index (1, 2, 3, ...), based on the list of questions I have asked you. You may also sort them from basic to advanced, so that they form a learning path for understanding RAG. This means the order does not have to follow the order in which I asked them. Questions from other chats should also be considered and sorted together with the existing questions.
+
+3. After sorting, tell me at which index the question I just asked appears in the question list in RAG_QA.
+
+4. Try to use simple, basic words when explaining my questions.

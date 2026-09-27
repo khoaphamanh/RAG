@@ -1,0 +1,283 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+
+
+\title{Retrieval-Augmented Generation: Original Formulation and Modern Practice}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Original RAG (Lewis et al., 2020)}
+
+\paragraph{Retriever (DPR).}
+A document $z$ is scored against the query $x$ with the dot product of two BERT encoders:
+\begin{equation}
+  p_\eta(z \mid x) \;\propto\; \exp\!\big(\mathbf{d}(z)^{\top}\mathbf{q}(x)\big),
+  \qquad
+  \mathbf{d}(z)=\mathrm{BERT}_d(z),\;\;
+  \mathbf{q}(x)=\mathrm{BERT}_q(x).
+\end{equation}
+Only the top-$k$ documents are kept, found with maximum inner product search (MIPS) via FAISS.
+
+\paragraph{Generator (BART).}
+The generator $p_\theta(y_i \mid x, z, y_{1:i-1})$ produces the answer token by token, conditioned on the query and one document. The retrieved document $z$ is treated as a latent variable and marginalized out. There are two variants.
+
+\medskip
+\noindent\textbf{RAG-Sequence} uses the same document for the whole answer:
+\begin{equation}
+  p(y \mid x) \;\approx\; \sum_{z \in \text{top-}k} p_\eta(z \mid x)
+  \prod_{i=1}^{N} p_\theta(y_i \mid x, z, y_{1:i-1}).
+  \label{eq:rag-seq}
+\end{equation}
+
+\noindent\textbf{RAG-Token} can use a different document for each token:
+\begin{equation}
+  p(y \mid x) \;\approx\; \prod_{i=1}^{N} \sum_{z \in \text{top-}k} p_\eta(z \mid x)\,
+  p_\theta(y_i \mid x, z, y_{1:i-1}).
+  \label{eq:rag-tok}
+\end{equation}
+
+\paragraph{Training.}
+Training minimizes the negative marginal log-likelihood over the training pairs $(x_j, y_j)$:
+\begin{equation}
+  \mathcal{L} = -\sum_j \log p(y_j \mid x_j).
+  \label{eq:loss}
+\end{equation}
+The document encoder $\mathrm{BERT}_d$ is kept frozen, so the index never needs rebuilding. Only $\mathrm{BERT}_q$ and BART are updated.
+
+\section{Modern Practical RAG}
+
+Without training, RAG reduces to three steps.
+
+\begin{equation}
+  \textbf{1. Embed:}\quad
+  \mathbf{e}_q = E(x), \qquad
+  \mathbf{e}_z = E(z)\;\; \forall z \in \mathcal{D}.
+\end{equation}
+
+\begin{equation}
+  \textbf{2. Retrieve:}\quad
+  Z_k = \operatorname*{top-\mathit{k}}_{z \in \mathcal{D}} \cos(\mathbf{e}_q, \mathbf{e}_z)
+      = \operatorname*{top-\mathit{k}}_{z \in \mathcal{D}}
+        \frac{\mathbf{e}_q^{\top}\mathbf{e}_z}{\lVert\mathbf{e}_q\rVert\,\lVert\mathbf{e}_z\rVert}.
+\end{equation}
+
+\begin{equation}
+  \textbf{3. Generate:}\quad
+  y = \mathrm{LLM}\big(\mathrm{prompt}(x, Z_k)\big).
+\end{equation}
+
+Step~3 is the in-context version of the paper's marginalization. Instead of summing probabilities over documents, the $k$ documents are concatenated into the prompt and the LLM decides which ones to use.
+
+\section{From the Paper to Modern RAG}
+
+Modern RAG keeps the \emph{idea} of Lewis et al.\ (retrieve from an external, non-parametric memory, then generate), but not their equations or training. The modern recipe is described most directly by two later papers.
+
+\paragraph{In-Context RALM (Ram et al., 2023).}
+Retrieved text is prepended to the input of a \emph{frozen} language model, with no training at all. This is exactly the three-step pipeline of Section~2:
+\begin{equation}
+  p(y \mid x) \;=\; \prod_{i=1}^{N} p_\theta\big(y_i \mid [\,z_1; \dots; z_k; x\,],\, y_{1:i-1}\big),
+  \qquad z_1,\dots,z_k \in Z_k,
+\end{equation}
+where $[\,\cdot\,;\,\cdot\,]$ is concatenation.
+
+\paragraph{REPLUG (Shi et al., 2023).}
+It treats the LLM as a black box and ensembles over the retrieved documents. This is RAG-Sequence~\eqref{eq:rag-seq} applied at inference time, with no gradient updates:
+\begin{equation}
+  p(y \mid x) \;=\; \sum_{z \in Z_k} \lambda(z, x)\; p_{\mathrm{LLM}}\big(y \mid [\,z; x\,]\big),
+  \qquad
+  \lambda(z, x) = \frac{\exp\big(\cos(\mathbf{e}_z,\mathbf{e}_q)\big)}{\sum_{z' \in Z_k}\exp\big(\cos(\mathbf{e}_{z'},\mathbf{e}_q)\big)}.
+\end{equation}
+
+\medskip
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & Original RAG (2020) & Modern RAG \\
+\midrule
+Retriever & DPR, query encoder fine-tuned & Any pretrained embedding model, frozen \\
+Generator & BART-large (400M), fine-tuned & Any LLM, frozen (local or API) \\
+Combining docs & Marginalize $\sum_z p_\eta(z\mid x)\,p_\theta(\cdot)$ & Concatenate $Z_k$ into the prompt \\
+Gradient updates & Yes, Eq.~\eqref{eq:loss} & None \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Fine-Tuning, LoRA and RAG}
+
+The key difference is \emph{where} the knowledge lives: in the weights (parametric) or in the document store $\mathcal{D}$ (non-parametric).
+
+\paragraph{Full fine-tuning.} All weights $\theta$ are updated by gradient descent:
+\begin{equation}
+  \theta^\ast = \arg\min_{\theta} \; -\sum_j \log p_\theta(y_j \mid x_j).
+\end{equation}
+
+\paragraph{LoRA (Hu et al., 2021).} The pretrained weight $W_0$ is frozen and only a low-rank update is trained:
+\begin{equation}
+  W = W_0 + BA, \qquad B \in \mathbb{R}^{d \times r},\; A \in \mathbb{R}^{r \times m},\; r \ll \min(d, m),
+\end{equation}
+\begin{equation}
+  (A^\ast, B^\ast) = \arg\min_{A,B} \; -\sum_j \log p_{W_0 + BA}(y_j \mid x_j).
+\end{equation}
+
+\paragraph{Modern RAG.} There is no $\arg\min$. The weights stay fixed and only the \emph{input} changes:
+\begin{equation}
+  y \sim p_{\theta}\big(\,\cdot \mid \mathrm{prompt}(x, Z_k(x))\big), \qquad \theta \text{ fixed}.
+\end{equation}
+To add or correct knowledge, you edit $\mathcal{D}$ and re-embed the changed chunks. Nothing is retrained.
+
+\section{Worked Example: Modern RAG, Step by Step}
+
+\paragraph{Step 0: Knowledge base and question.}
+Four chunks of course information and one question:
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+$z_1$ & ``The Machine Learning exam takes place on 15 February.'' \\
+$z_2$ & ``Machine Learning lectures are held in room H\,104.'' \\
+$z_3$ & ``The cafeteria serves pizza on Fridays.'' \\
+$z_4$ & ``For the exam, one handwritten A4 cheat sheet is allowed.'' \\
+\midrule
+$x$ & ``When is the Machine Learning exam?'' \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Step 1: Chunking.}
+Real documents are long, so each one is split into chunks of $L$ tokens with an overlap of $o$ tokens. For a document with tokens $t_1, \dots, t_T$, chunk $j$ is
+\begin{equation}
+  z_j = \big(t_{(j-1)(L-o)+1},\; \dots,\; t_{(j-1)(L-o)+L}\big), \qquad j = 1, \dots, \Big\lceil \tfrac{T-o}{L-o} \Big\rceil.
+\end{equation}
+Typical values are $L \approx 200$--$500$ and $o \approx 10$--$20\%$ of $L$. Here each sentence is already one chunk.
+
+\paragraph{Step 2: Embedding (offline, done once).}
+An embedding model $E$ maps text to a vector. Real models output 384--1024 dimensions. For hand calculation, use 3 dimensions roughly meaning (\textit{exam}, \textit{course}, \textit{food}):
+\begin{equation}
+  \mathbf{e}_{z_1} = \begin{pmatrix}0.9\\0.4\\0.0\end{pmatrix},\;
+  \mathbf{e}_{z_2} = \begin{pmatrix}0.1\\0.9\\0.1\end{pmatrix},\;
+  \mathbf{e}_{z_3} = \begin{pmatrix}0.0\\0.1\\1.0\end{pmatrix},\;
+  \mathbf{e}_{z_4} = \begin{pmatrix}0.7\\0.2\\0.1\end{pmatrix}.
+\end{equation}
+These vectors are stored in the index (e.g.\ a NumPy matrix, FAISS or Chroma).
+
+\paragraph{Step 3: Embed the query (online).}
+\begin{equation}
+  \mathbf{e}_q = E(x) = \begin{pmatrix}0.8\\0.6\\0.0\end{pmatrix}, \qquad \lVert \mathbf{e}_q \rVert = \sqrt{0.64 + 0.36} = 1.
+\end{equation}
+
+\paragraph{Step 4: Similarity.}
+Cosine similarity $\cos(\mathbf{e}_q, \mathbf{e}_z) = \mathbf{e}_q^\top \mathbf{e}_z \,/\, (\lVert\mathbf{e}_q\rVert\,\lVert\mathbf{e}_z\rVert)$:
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Chunk & $\mathbf{e}_q^\top \mathbf{e}_z$ & $\lVert \mathbf{e}_z \rVert$ & $\cos(\mathbf{e}_q, \mathbf{e}_z)$ & Rank \\
+\midrule
+$z_1$ & $0.8(0.9) + 0.6(0.4) + 0 = 0.96$ & $0.985$ & $\mathbf{0.975}$ & 1 \\
+$z_2$ & $0.8(0.1) + 0.6(0.9) + 0 = 0.62$ & $0.911$ & $0.681$ & 3 \\
+$z_3$ & $0.8(0.0) + 0.6(0.1) + 0 = 0.06$ & $1.005$ & $0.060$ & 4 \\
+$z_4$ & $0.8(0.7) + 0.6(0.2) + 0 = 0.68$ & $0.735$ & $\mathbf{0.925}$ & 2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Step 5: Top-$k$ retrieval.}
+With $k = 2$:
+\begin{equation}
+  Z_2 = \operatorname*{top-2}_{z \in \mathcal{D}} \cos(\mathbf{e}_q, \mathbf{e}_z) = \{ z_1, z_4 \}.
+\end{equation}
+The pizza chunk $z_3$ is correctly ignored. Brute-force search costs $O(|\mathcal{D}| \cdot d)$; FAISS/HNSW indexes make it sub-linear for millions of chunks.
+
+\paragraph{Step 6: Build the prompt.}
+\begin{equation}
+  \mathrm{prompt}(x, Z_2) = [\,\text{instruction};\; z_1;\; z_4;\; x\,]
+\end{equation}
+\begin{center}
+\fbox{\begin{minipage}{0.85\linewidth}\small\ttfamily
+Answer the question using only the context below.\\
+If the answer is not in the context, say you don't know.\\[4pt]
+Context:\\
+{[1]} The Machine Learning exam takes place on 15 February.\\
+{[2]} For the exam, one handwritten A4 cheat sheet is allowed.\\[4pt]
+Question: When is the Machine Learning exam?
+\end{minipage}}
+\end{center}
+
+\paragraph{Step 7: Generate.}
+The frozen LLM decodes token by token (greedy decoding shown):
+\begin{equation}
+  y_i = \arg\max_{v \in \mathcal{V}} \; p_\theta\big(v \mid \mathrm{prompt}(x, Z_2),\, y_{1:i-1}\big), \qquad i = 1, 2, \dots
+\end{equation}
+Output: $y =$ ``The exam is on 15 February [1].''
+
+\section{Worked Example: Original RAG with the Same Data}
+
+\paragraph{Retriever probabilities.}
+DPR scores are raw inner products of 768-dimensional vectors, so they are large. To mimic that, scale the cosines from Section~5 by 10 and apply a softmax over the top-2:
+\begin{equation}
+  s_{z_1} = 9.75,\quad s_{z_4} = 9.25, \qquad
+  p_\eta(z_1 \mid x) = \frac{e^{9.75}}{e^{9.75} + e^{9.25}} = 0.621,\quad
+  p_\eta(z_4 \mid x) = 0.379.
+\end{equation}
+
+\paragraph{Generator probabilities.}
+Let the target answer be $y = (y_1, y_2) = (\text{``15''}, \text{``February''})$. Assume the generator gives:
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Document & $p_\theta(y_1 \mid x, z)$ & $p_\theta(y_2 \mid x, z, y_1)$ & $p_\theta(y \mid x, z) = $ product \\
+\midrule
+$z_1$ (exam date) & 0.90 & 0.95 & 0.855 \\
+$z_4$ (cheat sheet) & 0.40 & 0.70 & 0.280 \\
+\bottomrule
+\end{tabular}
+\end{center}
+$z_4$ mentions the exam but not the date, so the generator is less sure with it.
+
+\paragraph{RAG-Sequence, Eq.~\eqref{eq:rag-seq}.}
+\begin{equation}
+  p(y \mid x) = 0.621 \times 0.855 + 0.379 \times 0.280 = 0.531 + 0.106 = 0.637.
+\end{equation}
+
+\paragraph{RAG-Token, Eq.~\eqref{eq:rag-tok}.} Mix per token first, then multiply:
+\begin{align}
+  p(y_1 \mid x) &= 0.621 \times 0.90 + 0.379 \times 0.40 = 0.711, \\
+  p(y_2 \mid x, y_1) &= 0.621 \times 0.95 + 0.379 \times 0.70 = 0.855, \\
+  p(y \mid x) &= 0.711 \times 0.855 = 0.608.
+\end{align}
+
+\paragraph{Loss.} For RAG-Sequence, Eq.~\eqref{eq:loss} for this single example is
+\begin{equation}
+  \mathcal{L} = -\log 0.637 = 0.451.
+\end{equation}
+
+\paragraph{Gradient for the retriever.}
+Write $p(y \mid x) = \sum_z \mathrm{softmax}(s)_z \, g_z$ with $g_z = p_\theta(y \mid x, z)$. Differentiating $-\log p(y \mid x)$ with respect to a score gives
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial s_z}
+  = \underbrace{p_\eta(z \mid x)}_{\text{prior}}
+  - \underbrace{\frac{p_\eta(z \mid x)\, g_z}{\sum_{z'} p_\eta(z' \mid x)\, g_{z'}}}_{\text{posterior } p(z \mid x, y)}.
+\end{equation}
+In the example the posteriors are $0.531/0.637 = 0.833$ for $z_1$ and $0.167$ for $z_4$, so
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial s_{z_1}} = 0.621 - 0.833 = -0.212, \qquad
+  \frac{\partial \mathcal{L}}{\partial s_{z_4}} = 0.379 - 0.167 = +0.212.
+\end{equation}
+Gradient descent therefore \emph{raises} the score of $z_1$ and lowers $z_4$. The retriever learns to prefer documents that help the generator produce the correct answer, without ever being told which document is ``correct''. This gradient flows into $\mathrm{BERT}_q$ through $s_z = \mathbf{d}(z)^\top \mathbf{q}(x)$. This is the step modern RAG skips.
+
+\section*{References}
+\begin{enumerate}\small
+  \item P.~Lewis et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. NeurIPS 2020. \url{https://arxiv.org/abs/2005.11401}
+  \item V.~Karpukhin et al. Dense Passage Retrieval for Open-Domain Question Answering. EMNLP 2020. \url{https://arxiv.org/abs/2004.04906}
+  \item O.~Ram et al. In-Context Retrieval-Augmented Language Models. TACL 2023. \url{https://arxiv.org/abs/2302.00083}
+  \item W.~Shi et al. REPLUG: Retrieval-Augmented Black-Box Language Models. 2023. \url{https://arxiv.org/abs/2301.12652}
+  \item G.~Izacard and E.~Grave. Leveraging Passage Retrieval with Generative Models for Open Domain Question Answering (FiD). 2020. \url{https://arxiv.org/abs/2007.01282}
+  \item Y.~Gao et al. Retrieval-Augmented Generation for Large Language Models: A Survey. 2023. \url{https://arxiv.org/abs/2312.10997}
+  \item E.~J.~Hu et al. LoRA: Low-Rank Adaptation of Large Language Models. 2021. \url{https://arxiv.org/abs/2106.09685}
+\end{enumerate}
+
+\end{document}
